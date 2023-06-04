@@ -10,7 +10,8 @@ from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
-from unet import ContextUNet
+from unet import ContextUnet
+import os
 
 # empty cache, just in case
 torch.cuda.empty_cache()
@@ -42,6 +43,68 @@ def ddpm_schedules(beta1, beta2, T):
         "sqrtmab": sqrtmab,  # \sqrt{1-\bar{\alpha_t}}
         "mab_over_sqrtmab": mab_over_sqrtmab_inv,  # (1-\alpha_t)/\sqrt{1-\bar{\alpha_t}}
     }
+
+
+class AdvancedDDPM(nn.Module):
+    def __init__(self, nn_model, n_T, device, data_sigma=0.5, drop_prob=0.1, rho=7):
+        super(AdvancedDDPM, self).__init__()
+
+        self.nn_model = nn_model
+        self.n_T = n_T
+        self.device = device
+        self.loss = nn.MSELoss()
+        self.data_sigma = data_sigma
+
+        self.rho = rho  # Weighting of sigma; rho = 7 in the paper, range 5-10 considered valid; 
+                        # more -> more effort during low noise; 3 - equalizes truncation error
+        self.drop_prob = drop_prob
+
+        self.sigma_max = 80
+        self.sigma_min = 0.002
+
+        self.P_mean = -1.2
+        self.P_std = 1.2
+
+    def c_in(self, sigma):
+        return 1.0 / torch.sqrt(sigma ** 2 + self.data_sigma ** 2)
+
+    def c_out(self, sigma):
+        return sigma * self.data_sigma / torch.sqrt(sigma ** 2 + self.data_sigma ** 2)
+
+    def c_skip(self, sigma):
+        return (self.data_sigma ** 2) / (sigma ** 2 + self.data_sigma ** 2)
+
+    def c_noise(self, sigma):
+        return torch.ln(sigma) / 4.0 # mmmm, smart formula (its empirical, probs should find something better)
+
+    def loss_weighting(self, sigma):
+        return (self.data_sigma ** 2 + sigma ** 2) / (((self.data_sigma ** 2) * (sigma ** 2)) ** 2)
+
+    def compute_sigma(self, t):
+        res = (
+            torch.power(self.sigma_max, 1 / self.rho) +
+            (t / (self.n_T - 1)) * (torch.power(self.sigma_min, 1 / self.rho) - torch.power(self.sigma_max, 1 / self.rho))
+        )
+        res[t == self.n_T] = 0.0
+
+        return torch.pow(res, self.rho)
+
+    def D_theta(self, x, sigma):
+        return (
+            self.c_skip(sigma) * x +
+            self.c_out(sigma) * self.nn_model(self.c_in(sigma) * x, self.c_noise(sigma))
+        )
+
+    def forward(self, x, c):
+        timestamps = torch.randint(1, self.n_T+1, (x.shape[0],)).to(self.device)  # t ~ Uniform(0, n_T)
+        sigmas = self.compute_sigma(timestamps)
+
+        pred = self.D_theta(x, sigmas)
+        loss = self.loss_weighting(sigmas) * self.loss(pred, x)
+        return loss
+
+    def sample(self, batch_size, *args, **kwargs):
+        pass
 
 
 class DDPM(nn.Module):
@@ -147,8 +210,12 @@ def train_mnist():
     n_feat = 64 # 128 ok, 256 better (but slower)
     lrate = 1e-4
     save_model = False
-    save_dir = './data/diffusion_outputs10_sophia/'
+    save_dir = './output/'
     ws_test = [0.0, 0.5, 2.0] # strength of generative guidance
+
+    # create the directory
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
     ddpm = DDPM(nn_model=ContextUnet(in_channels=1, n_feat=n_feat, n_classes=n_classes), betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
     ddpm.to(device)
