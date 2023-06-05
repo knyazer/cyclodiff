@@ -12,6 +12,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 from unet import ContextUnet
 from edm import EDMPrecond as EDM_Unet
+from losses import *
 import os
 
 # empty cache, just in case
@@ -65,6 +66,8 @@ class DDPM2(nn.Module):
         self.P_mean = -1.2
         self.P_std = 1.2
 
+        self.loss = EDMLoss()
+
     def c_in(self, sigma):
         return 1.0 / torch.sqrt(sigma ** 2 + self.data_sigma ** 2)
 
@@ -91,53 +94,64 @@ class DDPM2(nn.Module):
         return res ** self.rho
 
     def forward(self, x, c):
+        net = self.nn_model
+        self.sigma_data = 0.5
+
         rnd_normal = torch.randn([x.shape[0], 1, 1, 1], device=self.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-
-        pred = self.nn_model(x + torch.rand_like(x) * sigma, sigma)
-        loss = self.loss_weighting(sigma) * ((pred - x) ** 2)
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        n = torch.randn_like(x) * sigma
+        D_theta = net(x + n, sigma)
+        loss = weight * ((D_theta - x) ** 2)
         return loss.mean()
 
     def sample(self, n_sample, size, *args, **kwargs):
-        step_indices = torch.arange(self.n_T, dtype=torch.float32, device=self.device)
-        sigma = self.compute_sigma(step_indices)
-        latents = torch.randn(n_sample, *size, device=self.device)
+        # Adjust noise levels based on what's supported by the network.
+        sigma_min = self.sigma_min
+        sigma_max = self.sigma_max
+        latents = torch.stack([torch.randn(size, device=self.device) for _ in range(n_sample)])
+        rho = self.rho
+        net = self.nn_model
+        num_steps = self.n_T
 
-        S_churn = 0.0
-        S_max = float('inf')
-        S_noise = 1.0
-        S_min = 0.0
+        S_churn = 0
+        S_min = 0
+        S_max = float("inf")
+        S_noise = 1
+
+        # Time step discretization.
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=self.device)
+        t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
 
         x_i_store = []
 
-        x_next = latents * sigma[0]
-        print("Sampling...")
-        for i, (t_cur, t_next) in tqdm(enumerate(zip(sigma[:-1], sigma[1:]))): # 0, ..., N-1
+        # Main sampling loop.
+        x_next = latents.to(torch.float64) * t_steps[0]
+        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
             x_cur = x_next
 
             # Increase noise temporarily.
-            gamma = min(S_churn / self.n_T, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-            t_hat = t_cur + gamma * t_cur
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+            t_hat = net.round_sigma(t_cur + gamma * t_cur)
             x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
 
             # Euler step.
-            denoised = self.nn_model(x_hat, t_hat)
+            denoised = net(x_hat, t_hat, None).to(torch.float64)
             d_cur = (x_hat - denoised) / t_hat
             x_next = x_hat + (t_next - t_hat) * d_cur
 
             # Apply 2nd order correction.
-            if i < self.n_T - 1:
-                denoised = self.nn_model(x_next, t_next)
+            if i < num_steps - 1:
+                denoised = net(x_next, t_next, None).to(torch.float64)
                 d_prime = (x_next - denoised) / t_next
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
-            if i%10==0 or i==self.n_T or i < 8:
-                x_i_store.append(x_next.detach().cpu().numpy())
+            x_i_store.append(denoised.detach().cpu().numpy())
 
         x_i_store = np.array(x_i_store)
 
         return x_next, x_i_store
-
 
 class DDPM(nn.Module):
     def __init__(self, nn_model, betas, n_T, device, drop_prob=0.1):
@@ -236,7 +250,7 @@ def train_mnist():
     # hardcoding these here
     n_epoch = 20
     batch_size = 32 # 128 was default
-    n_T = 200 # 500
+    n_T = 18 # 500
     device = "cuda:0"
     n_classes = 10
     n_feat = 64 # 128 ok, 256 better (but slower)
