@@ -45,14 +45,13 @@ def ddpm_schedules(beta1, beta2, T):
     }
 
 
-class AdvancedDDPM(nn.Module):
-    def __init__(self, nn_model, n_T, device, data_sigma=0.5, drop_prob=0.1, rho=7):
-        super(AdvancedDDPM, self).__init__()
+class DDPM2(nn.Module):
+    def __init__(self, nn_model, n_T, device, data_sigma=0.5, drop_prob=0.1, rho=7, **kwargs):
+        super(DDPM2, self).__init__()
 
         self.nn_model = nn_model
         self.n_T = n_T
         self.device = device
-        self.loss = nn.MSELoss()
         self.data_sigma = data_sigma
 
         self.rho = rho  # Weighting of sigma; rho = 7 in the paper, range 5-10 considered valid; 
@@ -75,36 +74,78 @@ class AdvancedDDPM(nn.Module):
         return (self.data_sigma ** 2) / (sigma ** 2 + self.data_sigma ** 2)
 
     def c_noise(self, sigma):
-        return torch.ln(sigma) / 4.0 # mmmm, smart formula (its empirical, probs should find something better)
+        return torch.log(sigma) / 4.0 # mmmm, smart formula (its empirical, probs should find something better)
 
     def loss_weighting(self, sigma):
         return (self.data_sigma ** 2 + sigma ** 2) / (((self.data_sigma ** 2) * (sigma ** 2)) ** 2)
 
+    # Sigma scheduler for sampling
     def compute_sigma(self, t):
         res = (
-            torch.power(self.sigma_max, 1 / self.rho) +
-            (t / (self.n_T - 1)) * (torch.power(self.sigma_min, 1 / self.rho) - torch.power(self.sigma_max, 1 / self.rho))
+            (self.sigma_max ** (1 / self.rho)) +
+            (t / (self.n_T - 1)) * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))
         )
         res[t == self.n_T] = 0.0
 
-        return torch.pow(res, self.rho)
+        return res ** self.rho
 
     def D_theta(self, x, sigma):
         return (
             self.c_skip(sigma) * x +
-            self.c_out(sigma) * self.nn_model(self.c_in(sigma) * x, self.c_noise(sigma))
+            self.c_out(sigma) * self.F_theta(self.c_in(sigma) * x, self.c_noise(sigma))
         )
 
+    def F_theta(self, x, sigma):
+        zeros = torch.zeros((x.shape[0],)).to(torch.int64).to(self.device)
+        return self.nn_model(x + torch.randn_like(x) * sigma, zeros, sigma, zeros)
+
     def forward(self, x, c):
-        timestamps = torch.randint(1, self.n_T+1, (x.shape[0],)).to(self.device)  # t ~ Uniform(0, n_T)
-        sigmas = self.compute_sigma(timestamps)
+        rnd_normal = torch.randn([x.shape[0], 1, 1, 1], device=self.device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
 
-        pred = self.D_theta(x, sigmas)
-        loss = self.loss_weighting(sigmas) * self.loss(pred, x)
-        return loss
+        pred = self.D_theta(x, sigma)
+        loss = self.loss_weighting(sigma) * ((pred - x) ** 2)
+        return loss.mean()
 
-    def sample(self, batch_size, *args, **kwargs):
-        pass
+    def sample(self, n_sample, size, *args, **kwargs):
+        step_indices = torch.arange(self.n_T, device=self.device)
+        sigma = self.compute_sigma(step_indices)
+        latents = torch.randn((n_sample, *size), device=self.device)
+
+        S_churn = 0.0
+        S_max = float('inf')
+        S_noise = 1.0
+        S_min = 0.0
+
+        x_i_store = []
+
+        x_next = latents * sigma[0]
+        print("Sampling...")
+        for i, (t_cur, t_next) in tqdm(enumerate(zip(sigma[:-1], sigma[1:]))): # 0, ..., N-1
+            x_cur = x_next
+
+            # Increase noise temporarily.
+            gamma = min(S_churn / self.n_T, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+            t_hat = t_cur + gamma * t_cur
+            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
+
+            # Euler step.
+            denoised = self.D_theta(x_hat, t_hat)
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
+
+            # Apply 2nd order correction.
+            #if i < self.n_T - 1:
+            #    denoised = self.D_theta(x_next, t_next)
+            #    d_prime = (x_next - denoised) / t_next
+            #    x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+            if i%10==0 or i==self.n_T:
+                x_i_store.append(denoised.detach().cpu().numpy())
+
+        x_i_store = np.array(x_i_store)
+
+        return x_next, x_i_store
 
 
 class DDPM(nn.Module):
@@ -203,21 +244,21 @@ class DDPM(nn.Module):
 def train_mnist():
     # hardcoding these here
     n_epoch = 20
-    batch_size = 128
+    batch_size = 128 # 128 was default
     n_T = 400 # 500
     device = "cuda:0"
     n_classes = 10
     n_feat = 64 # 128 ok, 256 better (but slower)
     lrate = 1e-4
     save_model = False
-    save_dir = './output/'
+    save_dir = './output-2/'
     ws_test = [0.0, 0.5, 2.0] # strength of generative guidance
 
     # create the directory
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    ddpm = DDPM(nn_model=ContextUnet(in_channels=1, n_feat=n_feat, n_classes=n_classes), betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
+    ddpm = DDPM2(nn_model=ContextUnet(in_channels=1, n_feat=n_feat, n_classes=n_classes), betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
     ddpm.to(device)
 
     # optionally load a model
