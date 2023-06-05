@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 from unet import ContextUnet
+from edm import EDMPrecond as EDM_Unet
 import os
 
 # empty cache, just in case
@@ -77,7 +78,7 @@ class DDPM2(nn.Module):
         return torch.log(sigma) / 4.0 # mmmm, smart formula (its empirical, probs should find something better)
 
     def loss_weighting(self, sigma):
-        return (self.data_sigma ** 2 + sigma ** 2) / (((self.data_sigma ** 2) * (sigma ** 2)) ** 2)
+        return (self.data_sigma ** 2 + sigma ** 2) / ((self.data_sigma * sigma) ** 2)
 
     # Sigma scheduler for sampling
     def compute_sigma(self, t):
@@ -89,28 +90,18 @@ class DDPM2(nn.Module):
 
         return res ** self.rho
 
-    def D_theta(self, x, sigma):
-        return (
-            self.c_skip(sigma) * x +
-            self.c_out(sigma) * self.F_theta(self.c_in(sigma) * x, self.c_noise(sigma))
-        )
-
-    def F_theta(self, x, sigma):
-        zeros = torch.zeros((x.shape[0],)).to(torch.int64).to(self.device)
-        return self.nn_model(x + torch.randn_like(x) * sigma, zeros, sigma, zeros)
-
     def forward(self, x, c):
         rnd_normal = torch.randn([x.shape[0], 1, 1, 1], device=self.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
 
-        pred = self.D_theta(x, sigma)
+        pred = self.nn_model(x + torch.rand_like(x) * sigma, sigma)
         loss = self.loss_weighting(sigma) * ((pred - x) ** 2)
         return loss.mean()
 
     def sample(self, n_sample, size, *args, **kwargs):
-        step_indices = torch.arange(self.n_T, device=self.device)
+        step_indices = torch.arange(self.n_T, dtype=torch.float32, device=self.device)
         sigma = self.compute_sigma(step_indices)
-        latents = torch.randn((n_sample, *size), device=self.device)
+        latents = torch.randn(n_sample, *size, device=self.device)
 
         S_churn = 0.0
         S_max = float('inf')
@@ -130,18 +121,18 @@ class DDPM2(nn.Module):
             x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
 
             # Euler step.
-            denoised = self.D_theta(x_hat, t_hat)
+            denoised = self.nn_model(x_hat, t_hat)
             d_cur = (x_hat - denoised) / t_hat
             x_next = x_hat + (t_next - t_hat) * d_cur
 
             # Apply 2nd order correction.
-            #if i < self.n_T - 1:
-            #    denoised = self.D_theta(x_next, t_next)
-            #    d_prime = (x_next - denoised) / t_next
-            #    x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+            if i < self.n_T - 1:
+                denoised = self.nn_model(x_next, t_next)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
-            if i%10==0 or i==self.n_T:
-                x_i_store.append(denoised.detach().cpu().numpy())
+            if i%10==0 or i==self.n_T or i < 8:
+                x_i_store.append(x_next.detach().cpu().numpy())
 
         x_i_store = np.array(x_i_store)
 
@@ -244,8 +235,8 @@ class DDPM(nn.Module):
 def train_mnist():
     # hardcoding these here
     n_epoch = 20
-    batch_size = 128 # 128 was default
-    n_T = 400 # 500
+    batch_size = 32 # 128 was default
+    n_T = 200 # 500
     device = "cuda:0"
     n_classes = 10
     n_feat = 64 # 128 ok, 256 better (but slower)
@@ -258,7 +249,7 @@ def train_mnist():
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    ddpm = DDPM2(nn_model=ContextUnet(in_channels=1, n_feat=n_feat, n_classes=n_classes), betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
+    ddpm = DDPM2(nn_model=EDM_Unet(img_channels=1, img_resolution=28, sigma_data=0.5), rho=7, n_T=n_T, device=device, drop_prob=0.1)
     ddpm.to(device)
 
     # optionally load a model
