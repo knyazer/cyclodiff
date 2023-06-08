@@ -123,7 +123,7 @@ class ContextUnet(nn.Module):
             # nn.ConvTranspose2d(6 * n_feat, 2 * n_feat, 7, 7), # when concat temb and cemb end up w 6*n_feat
             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, 7, 7), # otherwise just have 2*n_feat
             nn.GroupNorm(8, 2 * n_feat),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
         self.up1 = UnetUp(4 * n_feat, n_feat)
@@ -131,7 +131,7 @@ class ContextUnet(nn.Module):
         self.out = nn.Sequential(
             nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1),
             nn.GroupNorm(8, n_feat),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
         )
 

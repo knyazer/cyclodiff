@@ -1,3 +1,20 @@
+''' 
+This script does conditional image generation on MNIST, using a diffusion model
+
+This code is modified from,
+https://github.com/cloneofsimo/minDiffusion
+
+Diffusion model is based on DDPM,
+https://arxiv.org/abs/2006.11239
+
+The conditioning idea is taken from 'Classifier-Free Diffusion Guidance',
+https://arxiv.org/abs/2207.12598
+
+This technique also features in ImageGen 'Photorealistic Text-to-Image Diffusion Modelswith Deep Language Understanding',
+https://arxiv.org/abs/2205.11487
+
+'''
+
 from typing import Dict, Tuple
 from tqdm import tqdm
 import torch
@@ -11,12 +28,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 from unet import ContextUnet
-from edm import EDMPrecond as EDM_Unet
-from losses import *
 import os
-
-# empty cache, just in case
-torch.cuda.empty_cache()
 
 def ddpm_schedules(beta1, beta2, T):
     """
@@ -47,112 +59,6 @@ def ddpm_schedules(beta1, beta2, T):
     }
 
 
-class DDPM2(nn.Module):
-    def __init__(self, nn_model, n_T, device, data_sigma=0.5, drop_prob=0.1, rho=7, **kwargs):
-        super(DDPM2, self).__init__()
-
-        self.nn_model = nn_model
-        self.n_T = n_T
-        self.device = device
-        self.data_sigma = data_sigma
-
-        self.rho = rho  # Weighting of sigma; rho = 7 in the paper, range 5-10 considered valid; 
-                        # more -> more effort during low noise; 3 - equalizes truncation error
-        self.drop_prob = drop_prob
-
-        self.sigma_max = 80
-        self.sigma_min = 0.002
-
-        self.P_mean = -1.2
-        self.P_std = 1.2
-
-        self.loss = EDMLoss()
-
-    def c_in(self, sigma):
-        return 1.0 / torch.sqrt(sigma ** 2 + self.data_sigma ** 2)
-
-    def c_out(self, sigma):
-        return sigma * self.data_sigma / torch.sqrt(sigma ** 2 + self.data_sigma ** 2)
-
-    def c_skip(self, sigma):
-        return (self.data_sigma ** 2) / (sigma ** 2 + self.data_sigma ** 2)
-
-    def c_noise(self, sigma):
-        return torch.log(sigma) / 4.0 # mmmm, smart formula (its empirical, probs should find something better)
-
-    def loss_weighting(self, sigma):
-        return (self.data_sigma ** 2 + sigma ** 2) / ((self.data_sigma * sigma) ** 2)
-
-    # Sigma scheduler for sampling
-    def compute_sigma(self, t):
-        res = (
-            (self.sigma_max ** (1 / self.rho)) +
-            (t / (self.n_T - 1)) * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))
-        )
-        res[t == self.n_T] = 0.0
-
-        return res ** self.rho
-
-    def forward(self, x, c):
-        net = self.nn_model
-        self.sigma_data = 0.5
-
-        rnd_normal = torch.randn([x.shape[0], 1, 1, 1], device=self.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        n = torch.randn_like(x) * sigma
-        D_theta = net(x + n, sigma)
-        loss = weight * ((D_theta - x) ** 2)
-        return loss.mean()
-
-    def sample(self, n_sample, size, *args, **kwargs):
-        # Adjust noise levels based on what's supported by the network.
-        sigma_min = self.sigma_min
-        sigma_max = self.sigma_max
-        latents = torch.stack([torch.randn(size, device=self.device) for _ in range(n_sample)])
-        rho = self.rho
-        net = self.nn_model
-        num_steps = self.n_T
-
-        S_churn = 0
-        S_min = 0
-        S_max = float("inf")
-        S_noise = 1
-
-        # Time step discretization.
-        step_indices = torch.arange(num_steps, dtype=torch.float64, device=self.device)
-        t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-        t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-
-        x_i_store = []
-
-        # Main sampling loop.
-        x_next = latents.to(torch.float64) * t_steps[0]
-        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-            x_cur = x_next
-
-            # Increase noise temporarily.
-            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-            t_hat = net.round_sigma(t_cur + gamma * t_cur)
-            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
-
-            # Euler step.
-            denoised = net(x_hat, t_hat, None).to(torch.float64)
-            d_cur = (x_hat - denoised) / t_hat
-            x_next = x_hat + (t_next - t_hat) * d_cur
-
-            # Apply 2nd order correction.
-            if i < num_steps - 1:
-                denoised = net(x_next, t_next, None).to(torch.float64)
-                d_prime = (x_next - denoised) / t_next
-                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-
-            x_i_store.append(denoised.detach().cpu().numpy())
-
-        x_i_store = np.array(x_i_store)
-
-        return x_next, x_i_store
-
 class DDPM(nn.Module):
     def __init__(self, nn_model, betas, n_T, device, drop_prob=0.1):
         super(DDPM, self).__init__()
@@ -167,6 +73,9 @@ class DDPM(nn.Module):
         self.device = device
         self.drop_prob = drop_prob
         self.loss_mse = nn.MSELoss()
+
+    def denoise_from_predicted_noise(self, x, eps, time_embedding, noise_rescale, x_rescale):
+        return (x - noise_rescale * eps) / x_rescale
 
     def forward(self, x, c):
         """
@@ -184,16 +93,6 @@ class DDPM(nn.Module):
 
         # dropout context with some probability
         context_mask = torch.bernoulli(torch.zeros_like(c)+self.drop_prob).to(self.device)
-
-        """
-        We are trying to train kind of diffusion gan
-        Lets denote x_t as the diffusion process on domain A, and y_t as the diffusion process on domain B
-        
-        Firstly, we make a prediction of x_t noise, conditioned on the y_t=y0*sqrt(alpha_t) + sqrt(1-alpha_t)*eps
-        Then, we make a prediction of y_{t-1} noise, conditioned on the x_t with removed step noise, so x_{t-1}_est = x_t - sqrt(alpha_t)*eps, kind of like single sampling step
-        Hence we get noise for y_{t-1}, which we can evaluate explicitly
-
-        """
         
         # return MSE between added noise, and our predicted noise
         return self.loss_mse(noise, self.nn_model(x_t, c, _ts / self.n_T, context_mask))
@@ -225,45 +124,51 @@ class DDPM(nn.Module):
             t_is = t_is.repeat(n_sample,1,1,1)
 
             # double batch
-            x_i = x_i.repeat(2,1,1,1)
-            t_is = t_is.repeat(2,1,1,1)
+            x_i_doubled = x_i.repeat(2,1,1,1)
+            t_is_doubled = t_is.repeat(2,1,1,1)
 
             z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
 
             # split predictions and compute weighting
-            eps = self.nn_model(x_i, c_i, t_is, context_mask)
+            eps = self.nn_model(x_i_doubled, c_i, t_is_doubled, context_mask)
             eps1 = eps[:n_sample]
             eps2 = eps[n_sample:]
             eps = (1+guide_w)*eps1 - guide_w*eps2
-            x_i = x_i[:n_sample]
+
+            denoised = self.denoise_from_predicted_noise(x_i, eps, t_is, self.sqrt_beta_t[i], self.oneover_sqrta[i])
+            d_cur = (x_i - denoised) / t_is
+
+            x_i = x_i_doubled[:n_sample]
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])
                 + self.sqrt_beta_t[i] * z
             )
-            if i%20==0 or i==self.n_T or i<8:
-                x_i_store.append(x_i.detach().cpu().numpy())
+            x_i_store.append(x_i.detach().cpu().numpy())
         
         x_i_store = np.array(x_i_store)
         return x_i, x_i_store
 
+
 def train_mnist():
+
     # hardcoding these here
     n_epoch = 20
-    batch_size = 32 # 128 was default
-    n_T = 18 # 500
+    batch_size = 256
+    n_T = 10 # 500
     device = "cuda:0"
     n_classes = 10
     n_feat = 64 # 128 ok, 256 better (but slower)
     lrate = 1e-4
     save_model = False
-    save_dir = './output-2/'
+    save_dir = './default-10sample/'
     ws_test = [0.0, 0.5, 2.0] # strength of generative guidance
 
-    # create the directory
+    # create folder if does not exist
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    ddpm = DDPM2(nn_model=EDM_Unet(img_channels=1, img_resolution=28, sigma_data=0.5), rho=7, n_T=n_T, device=device, drop_prob=0.1)
+
+    ddpm = DDPM(nn_model=ContextUnet(in_channels=1, n_feat=n_feat, n_classes=n_classes), betas=(1e-4, 0.02), n_T=n_T, device=device, drop_prob=0.1)
     ddpm.to(device)
 
     # optionally load a model
